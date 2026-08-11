@@ -2,26 +2,36 @@ import json
 import socket
 import threading
 import time
+import csv
 from link_state import LinkState
+from hamming import Hamming74
+
+def recvall(sock, n):
+    data = bytearray()
+    while len(data) < n:
+        packet = sock.recv(n - len(data))
+        if not packet:
+            return None
+        data.extend(packet)
+    return bytes(data)
 
 class RouterNode:
     def __init__(self, config_path):
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = json.load(f)
-        
+
         self.router_id = self.config["router_id"]
         self.ip = self.config["listen"]["ip"]
         self.port = self.config["listen"]["port"]
         self.neighbors = self.config["neighbors"]
-        
+        self.attached_host = self.config.get("attached_host", None)
+
         self.sequence = 0
         self.link_state = LinkState(self.router_id, self.neighbors)
         self.lock = threading.Lock()
 
     def start(self):
-        # Hilo de servidor (escucha)
         threading.Thread(target=self._listen_server, daemon=True).start()
-        # Hilo de transmisión periódica (LSA)
         threading.Thread(target=self._broadcast_lsa, daemon=True).start()
         
         print(f"Router {self.router_id} operativo en {self.ip}:{self.port}")
@@ -40,19 +50,25 @@ class RouterNode:
 
     def _handle_connection(self, client_sock):
         try:
-            # Los mensajes de control inician con el prefijo de longitud de 4 bytes
-            header = client_sock.recv(4)
+            header = recvall(client_sock, 4)
             if not header: return
             msg_length = int.from_bytes(header, 'big')
             
-            data = client_sock.recv(msg_length)
-            message = json.loads(data.decode('utf-8'))
+            data = recvall(client_sock, msg_length)
+            if not data: return
+            decoded_data = data.decode('utf-8')
             
-            if message.get("type") == "LSA":
-                self._process_lsa(message)
-                
+            if set(decoded_data).issubset({'0', '1'}):
+                self._forward_data(decoded_data)
+            else:
+                message = json.loads(decoded_data)
+                if message.get("type") == "LSA":
+                    self._process_lsa(message)
+                elif message.get("type") == "DATA":
+                    self._forward_json_data(message)
+                    
         except Exception as e:
-            pass
+            print(f"Error procesando conexión en {self.router_id}: {e}")
         finally:
             client_sock.close()
 
@@ -79,10 +95,9 @@ class RouterNode:
                 self.link_state.compute_shortest_paths()
             
             self._flood_lsa(lsa_msg)
-            time.sleep(10) # Transmisión periódica del LSA
+            time.sleep(10) 
 
     def _flood_lsa(self, lsa_msg):
-        # El reenvío actualiza from_router_id al router que realiza el salto
         forward_msg = dict(lsa_msg)
         forward_msg["from_router_id"] = self.router_id
         
@@ -90,7 +105,6 @@ class RouterNode:
         header = len(payload).to_bytes(4, 'big')
         
         for neighbor in self.neighbors:
-            # Evitar enviar de vuelta al nodo que transmitió la LSA
             if neighbor["router_id"] == lsa_msg.get("from_router_id"):
                 continue
                 
@@ -102,8 +116,95 @@ class RouterNode:
             except ConnectionRefusedError:
                 pass
 
+    def _load_routing_table(self):
+        routing_table = {}
+        filepath = f'data/{self.router_id}_tabla_enrutamiento.csv'
+        try:
+            with open(filepath, mode='r') as file:
+                reader = csv.DictReader(file)
+                for row in reader:
+                    routing_table[row["destination_router_id"]] = {
+                        "next_hop_ip": row["next_hop_ip"],
+                        "next_hop_port": int(row["next_hop_port"])
+                    }
+        except FileNotFoundError:
+            pass
+        return routing_table
+
+    def _forward_json_data(self, message):
+        dest_gateway = message.get("destination", {}).get("gateway_id")
+        routing_table = self._load_routing_table()
+        
+        if dest_gateway not in routing_table:
+            print(f"[{self.router_id}] Destino {dest_gateway} no existe en tabla de ruteo.")
+            return
+
+        next_hop = routing_table[dest_gateway]
+        noise_prob = message.get("noise", {}).get("bit_flip_probability", 0.0)
+        
+        forward_bits = Hamming74.encode_message(json.dumps(message), noise_prob)
+        
+        payload = forward_bits.encode('utf-8')
+        header = len(payload).to_bytes(4, 'big')
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((next_hop["next_hop_ip"], next_hop["next_hop_port"]))
+            s.sendall(header + payload)
+            s.close()
+        except ConnectionRefusedError:
+            print(f"[{self.router_id}] Falla al enviar al salto {next_hop['next_hop_ip']}:{next_hop['next_hop_port']}")
+
+    def _forward_data(self, bit_string):
+        json_str = Hamming74.decode_message(bit_string)
+        if not json_str: return
+
+        try:
+            message = json.loads(json_str)
+        except json.JSONDecodeError:
+            return
+
+        dest_gateway = message.get("destination", {}).get("gateway_id")
+        
+        if dest_gateway == self.router_id:
+            if self.attached_host:
+                self._send_to_host(message)
+            return
+
+        routing_table = self._load_routing_table()
+        if dest_gateway not in routing_table:
+            return
+
+        next_hop = routing_table[dest_gateway]
+        noise_prob = message.get("noise", {}).get("bit_flip_probability", 0.0)
+        forward_bits = Hamming74.encode_message(json.dumps(message), noise_prob)
+        
+        payload = forward_bits.encode('utf-8')
+        header = len(payload).to_bytes(4, 'big')
+
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((next_hop["next_hop_ip"], next_hop["next_hop_port"]))
+            s.sendall(header + payload)
+            s.close()
+        except ConnectionRefusedError:
+            pass
+
+    def _send_to_host(self, message):
+        try:
+            payload = json.dumps(message).encode('utf-8')
+            header = len(payload).to_bytes(4, 'big')
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((self.attached_host["ip"], self.attached_host["port"]))
+            s.sendall(header + payload)
+            s.close()
+        except ConnectionRefusedError:
+            pass
+
 if __name__ == "__main__":
     import sys
     if len(sys.argv) > 1:
         router = RouterNode(sys.argv[1])
         router.start()
+    else:
+        print("Uso: python src/router.py <config.json>")

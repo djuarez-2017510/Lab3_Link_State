@@ -12,7 +12,6 @@ class LinkState:
         origin = lsa_message["origin_router_id"]
         seq = lsa_message["sequence"]
         
-        # Se conserva la secuencia más alta recibida por cada origin_router_id
         if origin not in self.lsdb or seq > self.lsdb[origin]["sequence"]:
             self.lsdb[origin] = lsa_message
             return True
@@ -51,7 +50,7 @@ class LinkState:
 
     def _generate_csv(self, distances, previous):
         os.makedirs('data', exist_ok=True)
-        filepath = 'data/nodo_tabla_enrutamiento.csv'
+        filepath = f'data/{self.router_id}_tabla_enrutamiento.csv'
         
         with open(filepath, mode='w', newline='') as file:
             writer = csv.writer(file)
