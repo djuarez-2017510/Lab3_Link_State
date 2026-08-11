@@ -1,3 +1,0 @@
-destination_router_id,next_hop_router_id,next_hop_ip,next_hop_port,total_cost
-V,V,127.0.0.1,9002,2
-U,V,127.0.0.1,9002,5
