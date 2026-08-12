@@ -80,6 +80,38 @@ def send_json(ip, port, message, timeout=DEFAULT_TIMEOUT):
     return send_framed(ip, port, json.dumps(message), timeout)
 
 
+def send_json_expect_reply(ip, port, message, timeout=DEFAULT_TIMEOUT,
+                           reply_timeout=1.5):
+    """Envia un JSON y ademas intenta leer una respuesta por la misma conexion.
+
+    Se usa para HELLO. El contrato incluye `listen_port` en el HELLO, lo que
+    sugiere contestar por una conexion nueva, pero no prohibe responder sobre la
+    conexion abierta. Al aceptar ambas formas, la adyacencia se establece sea
+    cual sea la interpretacion que haya implementado la otra pareja.
+
+    Devuelve (entregado, respuesta_o_None).
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((ip, port))
+        sock.sendall(frame(json.dumps(message)))
+    except OSError:
+        sock.close()
+        return False, None
+
+    try:
+        # Si el par no contesta por aqui, cierra o expira y se sigue esperando
+        # su respuesta por una conexion entrante.
+        sock.settimeout(reply_timeout)
+        reply = recv_framed(sock)
+    except OSError:
+        reply = None
+    finally:
+        sock.close()
+    return True, reply
+
+
 def reply_framed(sock, body):
     """Escribe una respuesta sobre una conexion ya abierta.
 

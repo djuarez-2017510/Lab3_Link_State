@@ -1,0 +1,6 @@
+{
+  "host_id": "BANK",
+  "role": "SERVER",
+  "listen": { "ip": "127.0.0.1", "port": 8002 },
+  "gateway": { "router_id": "X", "ip": "127.0.0.1", "port": 9003 }
+}

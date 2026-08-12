@@ -12,6 +12,7 @@ Uso:
     python src/router.py config/router_u.json
 """
 
+import ipaddress
 import json
 import socket
 import sys
@@ -40,19 +41,46 @@ class RouterNode:
         with open(config_path, "r", encoding="utf-8") as handle:
             self.config = json.load(handle)
 
-        self.router_id = self.config["router_id"]
-        self.ip = self.config["listen"]["ip"]
-        self.port = self.config["listen"]["port"]
+        self.router_id = str(self.config["router_id"]).strip()
+        self.ip = str(self.config["listen"]["ip"]).strip()
+        self.port = int(self.config["listen"]["port"])
         self.neighbors = self.config["neighbors"]
         self.attached_host = self.config.get("attached_host")
+
+        # Los archivos se editan a mano entre varias personas, asi que se
+        # normalizan los valores de texto: un espacio sobrante en una IP la hace
+        # irresoluble y el sintoma aparenta ser un problema de red.
+        for neighbor in self.neighbors:
+            neighbor["router_id"] = str(neighbor["router_id"]).strip()
+            neighbor["ip"] = str(neighbor["ip"]).strip()
+            neighbor["port"] = int(neighbor["port"])
+        if self.attached_host:
+            self.attached_host["ip"] = str(self.attached_host["ip"]).strip()
+            self.attached_host["port"] = int(self.attached_host["port"])
 
         self.neighbors_by_id = {n["router_id"]: n for n in self.neighbors}
         # Estado de adyacencia alimentado por HELLO_REPLY. Solo los vecinos
         # activos se anuncian en nuestra LSA, de modo que la caida de un nodo
         # se propaga por la red y Dijkstra deja de usar ese enlace.
+        #
+        # `reachable` guarda si el ultimo HELLO se pudo entregar por TCP, dato
+        # distinto de `up`: permite separar un problema de red (no se conecta)
+        # de un problema de la otra implementacion (conecta pero no responde).
+        # `hello_in` registra si el vecino nos ha contactado por iniciativa
+        # propia. Distinguirlo de `reachable` importa: un vecino puede contestar
+        # nuestro HELLO sobre la conexion que abrimos y aun asi tener mal
+        # configurada nuestra IP o puerto, con lo cual nunca nos enviara sus LSAs
+        # y no habra rutas.
         self.neighbor_state = {
-            rid: {"up": False, "last_seen": 0.0} for rid in self.neighbors_by_id
+            rid: {
+                "up": False,
+                "last_seen": 0.0,
+                "reachable": False,
+                "hello_in": False,
+            }
+            for rid in self.neighbors_by_id
         }
+        self._hello_rounds = 0
 
         self.sequence = 0
         self.state_lock = threading.Lock()
@@ -73,6 +101,28 @@ class RouterNode:
         threading.Thread(target=self._lsa_loop, name="routing", daemon=True).start()
 
         self.log(f"Router {self.router_id} operativo en {self.ip}:{self.port}")
+        if self.ip == "127.0.0.1" and any(
+            not n["ip"].startswith("127.") for n in self.neighbors
+        ):
+            # Error de configuracion tipico al pasar de local a Tailscale.
+            self.log(
+                f"[{self.router_id}] AVISO: listen.ip es 127.0.0.1 pero hay "
+                f"vecinos remotos. Ningun nodo externo podra conectarse; use "
+                f"0.0.0.0."
+            )
+        for neighbor in self.neighbors:
+            self.log(
+                f"[{self.router_id}] vecino configurado {neighbor['router_id']} "
+                f"en {neighbor['ip']}:{neighbor['port']} costo {neighbor['cost']}"
+            )
+            try:
+                ipaddress.ip_address(neighbor["ip"])
+            except ValueError:
+                self.log(
+                    f"[{self.router_id}] AVISO: '{neighbor['ip']}' no es una "
+                    f"direccion IP valida. Se intentara resolver como nombre, "
+                    f"pero revise que no tenga caracteres de mas."
+                )
         if self.attached_host:
             host = self.attached_host
             self.log(
@@ -156,13 +206,104 @@ class RouterNode:
             "origin_router_id": self.router_id,
             "listen_port": self.port,
         }
-        for neighbor in self.neighbors:
-            net.send_json(neighbor["ip"], neighbor["port"], hello)
+        # Un vecino por hilo: cada envio puede tardar hasta el timeout esperando
+        # una posible respuesta, y en serie eso excederia el intervalo de HELLO.
+        hilos = [
+            threading.Thread(target=self._hello_to, args=(n, hello), daemon=True)
+            for n in self.neighbors
+        ]
+        for hilo in hilos:
+            hilo.start()
+        for hilo in hilos:
+            hilo.join(timeout=net.DEFAULT_TIMEOUT + 2.0)
 
         now = time.monotonic()
         for rid, state in self.neighbor_state.items():
             if state["up"] and now - state["last_seen"] > NEIGHBOR_TIMEOUT:
                 self._set_neighbor_up(rid, False, "sin respuesta a HELLO")
+
+        self._hello_rounds += 1
+        self._report_pending_neighbors()
+
+    def _advertised_endpoint(self):
+        """Direccion que los vecinos deben tener configurada para alcanzarnos."""
+        if self.ip in ("0.0.0.0", ""):
+            # Con bind en todas las interfaces hay que decir cual usar de verdad.
+            try:
+                probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                probe.connect(("100.100.100.100", 80))
+                local_ip = probe.getsockname()[0]
+                probe.close()
+                return f"{local_ip}:{self.port}"
+            except OSError:
+                return f"<su-ip-de-tailscale>:{self.port}"
+        return f"{self.ip}:{self.port}"
+
+    def _hello_to(self, neighbor, hello):
+        """Envia un HELLO a un vecino y atiende la respuesta si viene en linea."""
+        router_id = neighbor["router_id"]
+        entregado, respuesta = net.send_json_expect_reply(
+            neighbor["ip"], neighbor["port"], hello
+        )
+        self.neighbor_state[router_id]["reachable"] = entregado
+        if not respuesta:
+            return
+
+        try:
+            message = json.loads(respuesta)
+        except json.JSONDecodeError:
+            self.log(
+                f"[{self.router_id}] respuesta de {router_id} descartada: "
+                f"JSON invalido"
+            )
+            return
+        if message.get("type") == "HELLO_REPLY":
+            self._handle_hello_reply(message)
+
+    def _report_pending_neighbors(self):
+        """Informa periodicamente por que un vecino aun no esta activo.
+
+        Sin esto, un router que no logra formar ninguna adyacencia se queda en
+        silencio y no hay forma de saber si el problema es de red, de
+        configuracion o de la implementacion del otro extremo.
+        """
+        # Cada tres rondas (unos 15 s) para dar diagnostico sin inundar la salida.
+        if self._hello_rounds % 3 != 1:
+            return
+
+        # Caso silencioso: la adyacencia esta activa porque el vecino contesta
+        # nuestro HELLO, pero nunca nos contacta el. Casi siempre significa que
+        # tiene mal nuestra IP o nuestro puerto, y sin sus LSAs no hay rutas.
+        for rid, state in self.neighbor_state.items():
+            if state["up"] and not state["hello_in"]:
+                neighbor = self.neighbors_by_id[rid]
+                self.log(
+                    f"[{self.router_id}] vecino {rid} responde pero nunca nos "
+                    f"contacta: no llegan HELLO ni LSA suyos. Pedirle que "
+                    f"verifique que nos tiene configurados como "
+                    f"'{self.router_id}' en {self._advertised_endpoint()} "
+                    f"(el enlace vale {neighbor['cost']})."
+                )
+
+        pendientes = [
+            rid for rid, state in self.neighbor_state.items() if not state["up"]
+        ]
+        for rid in pendientes:
+            neighbor = self.neighbors_by_id[rid]
+            destino = f"{neighbor['ip']}:{neighbor['port']}"
+            if self.neighbor_state[rid]["reachable"]:
+                self.log(
+                    f"[{self.router_id}] vecino {rid} PENDIENTE: el HELLO se "
+                    f"entrego a {destino}, pero no llega HELLO_REPLY. Revisar que "
+                    f"su implementacion responda HELLO y que su router_id sea "
+                    f"'{rid}'."
+                )
+            else:
+                self.log(
+                    f"[{self.router_id}] vecino {rid} PENDIENTE: no se puede "
+                    f"conectar a {destino}. Revisar que su router este levantado, "
+                    f"que su listen.ip sea 0.0.0.0 (no 127.0.0.1) y el firewall."
+                )
 
     def _handle_hello(self, message, addr, client):
         """Responde un HELLO validando que la identidad coincida con la config."""
@@ -174,6 +315,13 @@ class RouterNode:
                 f"configurado (desde {addr[0]})"
             )
             return
+
+        if not self.neighbor_state[origin]["hello_in"]:
+            self.neighbor_state[origin]["hello_in"] = True
+            self.log(
+                f"[{self.router_id}] HELLO entrante de {origin} desde {addr[0]}: "
+                f"contacto bidireccional confirmado"
+            )
 
         reply = json.dumps({
             "type": "HELLO_REPLY",
