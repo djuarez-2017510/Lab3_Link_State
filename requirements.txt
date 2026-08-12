@@ -1,0 +1,4 @@
+# El proyecto usa unicamente la biblioteca estandar de Python 3.8 o superior
+# (json, socket, threading, csv, heapq, random, uuid). No hay dependencias
+# externas: este archivo existe para documentarlo y para que
+# `pip install -r requirements.txt` funcione sin error en cualquier plataforma.

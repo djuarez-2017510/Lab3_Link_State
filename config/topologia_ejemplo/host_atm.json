@@ -1,0 +1,17 @@
+{
+  "host_id": "ATM",
+  "role": "CLIENT",
+  "listen": {
+    "ip": "127.0.0.1",
+    "port": 8101
+  },
+  "gateway": {
+    "router_id": "A",
+    "ip": "127.0.0.1",
+    "port": 9101
+  },
+  "peer": {
+    "host_id": "BANK",
+    "gateway_id": "G"
+  }
+}

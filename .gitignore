@@ -1,0 +1,12 @@
+# Tablas de ruteo: se regeneran en cada ejecucion
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Empaquetado del entregable
+*.zip
+*.rar

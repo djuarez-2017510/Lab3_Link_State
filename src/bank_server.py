@@ -1,139 +1,190 @@
+"""Servidor bancario: host destino, conectado unicamente a su router gateway.
+
+No es un router y no participa en el plano de control. Recibe envolturas DATA ya
+corregidas desde su gateway, mantiene el estado de cada transaccion por
+session_id y responde con otra envoltura DATA intercambiando origen y destino.
+
+Uso:
+    python src/bank_server.py [config/host_bank.json]
+"""
+
 import json
+import os
 import socket
+import sys
 import threading
 import uuid
 
-def recvall(sock, n):
-    data = bytearray()
-    while len(data) < n:
-        packet = sock.recv(n - len(data))
-        if not packet:
-            return None
-        data.extend(packet)
-    return bytes(data)
+import net
+
+# Tarjeta y PIN de prueba fijados para el laboratorio.
+VALID_PIN = "0507"
+INITIAL_BALANCE = 10000
+
 
 class BankServer:
-    def __init__(self, listen_ip='127.0.0.1', listen_port=8002, gateway_ip='127.0.0.1', gateway_port=9003):
-        self.listen_ip = listen_ip
-        self.listen_port = listen_port
-        self.gateway_ip = gateway_ip
-        self.gateway_port = gateway_port
+    def __init__(self, config_path):
+        with open(config_path, "r", encoding="utf-8") as handle:
+            config = json.load(handle)
+
+        self.host_id = config.get("host_id", "BANK")
+        self.ip = config["listen"]["ip"]
+        self.port = config["listen"]["port"]
+        self.gateway = config["gateway"]
+
         self.sessions = {}
+        self.lock = threading.Lock()
+
+    def log(self, message):
+        print(message, flush=True)
 
     def start(self):
-        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server_socket.bind((self.listen_ip, self.listen_port))
-        server_socket.listen(10)
-        
-        print(f"Servidor Bancario operativo en {self.listen_ip}:{self.listen_port}")
-        
-        while True:
-            client_sock, _ = server_socket.accept()
-            threading.Thread(target=self._handle_connection, args=(client_sock,), daemon=True).start()
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.ip, self.port))
+        server.listen(16)
 
-    def _handle_connection(self, client_sock):
+        self.log(f"Servidor bancario {self.host_id} operativo en {self.ip}:{self.port}")
+        self.log(
+            f"Gateway: {self.gateway['router_id']} en "
+            f"{self.gateway['ip']}:{self.gateway['port']}"
+        )
+
         try:
-            header = recvall(client_sock, 4)
-            if not header: return
-            msg_length = int.from_bytes(header, 'big')
-            
-            data = recvall(client_sock, msg_length)
-            if not data: return
-            message = json.loads(data.decode('utf-8'))
-            
-            if message.get("type") == "DATA":
-                response = self._process_transaction(message)
-                if response:
-                    self._send_to_gateway(response)
-                    
-        except Exception:
-            pass
-        finally:
-            client_sock.close()
+            while True:
+                client, _ = server.accept()
+                threading.Thread(
+                    target=self._handle_connection, args=(client,), daemon=True
+                ).start()
+        except KeyboardInterrupt:
+            self.log("\nServidor bancario detenido.")
 
-    def _process_transaction(self, message):
+    def _handle_connection(self, client):
+        try:
+            body = net.recv_framed(client)
+            if not body:
+                return
+            message = json.loads(body)
+            if message.get("type") != "DATA":
+                return
+
+            response = self._process(message)
+            if response:
+                sent = net.send_json(
+                    self.gateway["ip"], self.gateway["port"], response
+                )
+                if not sent:
+                    self.log(
+                        f"[!] No se pudo alcanzar el gateway "
+                        f"{self.gateway['router_id']}; respuesta perdida."
+                    )
+        except json.JSONDecodeError:
+            self.log("[!] Trama descartada: JSON invalido.")
+        except Exception as exc:  # noqa: BLE001
+            self.log(f"[!] Error procesando conexion: {exc}")
+        finally:
+            client.close()
+
+    def _process(self, message):
+        """Aplica la maquina de estados bancaria y devuelve la respuesta DATA."""
         session_id = message.get("session_id")
-        payload_data = message.get("payload", {})
-        command = payload_data.get("command")
-        val = payload_data.get("payload")
-        
-        print(f"[*] Requerimiento recibido -> Sesión: {session_id} | Comando: {command} | Valor: '{val}'")
-        
-        if command == "START_TRANSACTION":
-            self.sessions[session_id] = {"state": "WAITING_CARD", "balance": 10000}
-            return self._build_response(message, "TRANSACTION_READY", "")
-            
-        if session_id not in self.sessions:
-            return self._build_response(message, "PROTOCOL_ERROR", "Sesión inactiva o inválida.")
-            
-        session = self.sessions[session_id]
-        state = session["state"]
-        
-        if command == "CARD" and state == "WAITING_CARD":
-            session["state"] = "WAITING_PIN"
-            return self._build_response(message, "CARD_ACCEPTED", "")
-            
-        elif command == "PIN" and state == "WAITING_PIN":
-            if val == "0507":
-                session["state"] = "WAITING_OPTION"
-                return self._build_response(message, "PIN_ACCEPTED", "")
-            else:
+        payload = message.get("payload", {})
+        command = payload.get("command")
+        value = payload.get("payload", "")
+
+        self.log(
+            f"[*] Sesion: {session_id} | Comando: {command} | Valor: '{value}'"
+        )
+
+        with self.lock:
+            if command == "START_TRANSACTION":
+                self.sessions[session_id] = {
+                    "state": "WAITING_CARD",
+                    "balance": INITIAL_BALANCE,
+                }
+                return self._respond(message, "TRANSACTION_READY")
+
+            session = self.sessions.get(session_id)
+            if session is None:
+                return self._respond(
+                    message, "PROTOCOL_ERROR", "Sesion inactiva o invalida."
+                )
+
+            state = session["state"]
+
+            if command == "CARD" and state == "WAITING_CARD":
+                # Validacion minima acordada para el laboratorio: la tarjeta debe
+                # ser numerica y de al menos 4 digitos.
+                if not value.isdigit() or len(value) < 4:
+                    del self.sessions[session_id]
+                    return self._respond(message, "CARD_INVALID")
+                session["state"] = "WAITING_PIN"
+                return self._respond(message, "CARD_ACCEPTED")
+
+            if command == "PIN" and state == "WAITING_PIN":
+                if value == VALID_PIN:
+                    session["state"] = "WAITING_OPTION"
+                    return self._respond(message, "PIN_ACCEPTED")
                 del self.sessions[session_id]
-                return self._build_response(message, "PIN_INCORRECT", "")
-                
-        elif command == "OPTION" and state == "WAITING_OPTION":
-            if val == "1":
-                session["state"] = "COMPLETED"
-                return self._build_response(message, "BALANCE", str(session["balance"]))
-            elif val == "2":
-                session["state"] = "WAITING_AMOUNT"
-                return self._build_response(message, "REQUEST_AMOUNT", "")
-                
-        elif command == "AMOUNT" and state == "WAITING_AMOUNT":
-            amount = int(val)
-            if amount <= session["balance"]:
+                return self._respond(message, "PIN_INCORRECT")
+
+            if command == "OPTION" and state == "WAITING_OPTION":
+                if value == "1":
+                    session["state"] = "COMPLETED"
+                    return self._respond(
+                        message, "BALANCE", str(session["balance"])
+                    )
+                if value == "2":
+                    session["state"] = "WAITING_AMOUNT"
+                    return self._respond(message, "REQUEST_AMOUNT")
+                del self.sessions[session_id]
+                return self._respond(
+                    message, "PROTOCOL_ERROR", "Se esperaba la opcion 1 o 2."
+                )
+
+            if command == "AMOUNT" and state == "WAITING_AMOUNT":
+                if not value.isdigit() or int(value) <= 0:
+                    del self.sessions[session_id]
+                    return self._respond(
+                        message, "PROTOCOL_ERROR", "Se esperaba un monto positivo."
+                    )
+                amount = int(value)
+                if amount > session["balance"]:
+                    # El contrato conserva WAITING_AMOUNT: el ATM puede reintentar.
+                    return self._respond(
+                        message, "INSUFFICIENT_FUNDS", str(session["balance"])
+                    )
                 session["balance"] -= amount
                 session["state"] = "COMPLETED"
-                return self._build_response(message, "WITHDRAWAL_SUCCESSFUL", str(session["balance"]))
-            else:
-                return self._build_response(message, "INSUFFICIENT_FUNDS", str(session["balance"]))
-                
-        elif command == "LOGOUT":
-            if session_id in self.sessions:
-                del self.sessions[session_id]
-            return self._build_response(message, "LOGOUT_ACK", "")
-            
-        else:
-            del self.sessions[session_id]
-            return self._build_response(message, "PROTOCOL_ERROR", f"Comando inesperado: {command}")
+                return self._respond(
+                    message, "WITHDRAWAL_SUCCESSFUL", str(session["balance"])
+                )
 
-    def _build_response(self, original_msg, resp_command, resp_payload):
+            if command == "LOGOUT":
+                del self.sessions[session_id]
+                return self._respond(message, "LOGOUT_ACK")
+
+            del self.sessions[session_id]
+            return self._respond(
+                message,
+                "PROTOCOL_ERROR",
+                f"Comando '{command}' inesperado en estado {state}.",
+            )
+
+    def _respond(self, original, command, value=""):
+        """Construye la respuesta DATA intercambiando origen y destino."""
         return {
             "type": "DATA",
             "packet_id": f"p-{uuid.uuid4().hex[:6]}",
-            "session_id": original_msg["session_id"],
-            "origin": original_msg["destination"],
-            "destination": original_msg["origin"],
-            "noise": original_msg["noise"],
-            "payload": {
-                "command": resp_command,
-                "payload": resp_payload
-            }
+            "session_id": original["session_id"],
+            "origin": original["destination"],
+            "destination": original["origin"],
+            "noise": original.get("noise", {"bit_flip_probability": 0.0}),
+            "payload": {"command": command, "payload": value},
         }
 
-    def _send_to_gateway(self, message):
-        try:
-            payload = json.dumps(message).encode('utf-8')
-            header = len(payload).to_bytes(4, 'big')
-            
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((self.gateway_ip, self.gateway_port))
-            s.sendall(header + payload)
-            s.close()
-        except ConnectionRefusedError:
-            pass
 
 if __name__ == "__main__":
-    server = BankServer()
-    server.start()
+    default_config = os.path.join(net.CONFIG_DIR, "host_bank.json")
+    config_path = sys.argv[1] if len(sys.argv) > 1 else default_config
+    BankServer(config_path).start()

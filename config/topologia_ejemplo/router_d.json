@@ -1,0 +1,34 @@
+{
+  "router_id": "D",
+  "listen": {
+    "ip": "127.0.0.1",
+    "port": 9104
+  },
+  "neighbors": [
+    {
+      "router_id": "C",
+      "ip": "127.0.0.1",
+      "port": 9103,
+      "cost": 3
+    },
+    {
+      "router_id": "E",
+      "ip": "127.0.0.1",
+      "port": 9105,
+      "cost": 5
+    },
+    {
+      "router_id": "F",
+      "ip": "127.0.0.1",
+      "port": 9106,
+      "cost": 2
+    },
+    {
+      "router_id": "I",
+      "ip": "127.0.0.1",
+      "port": 9109,
+      "cost": 6
+    }
+  ],
+  "attached_host": null
+}
