@@ -1,0 +1,27 @@
+{
+  "router_id": "N6",
+  "listen": {
+    "ip": "0.0.0.0",
+    "port": 9606
+  },
+  "neighbors": [
+    {
+      "router_id": "N4",
+      "ip": "127.0.0.1",
+      "port": 9604,
+      "cost": 3
+    },
+    {
+      "router_id": "N5",
+      "ip": "127.0.0.1",
+      "port": 9605,
+      "cost": 1
+    }
+  ],
+  "attached_host": {
+    "role": "SERVER",
+    "host_id": "BANK",
+    "ip": "127.0.0.1",
+    "port": 8602
+  }
+}

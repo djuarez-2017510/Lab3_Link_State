@@ -412,11 +412,17 @@ class RouterNode:
                 self._recompute()
 
         if not is_new:
+            # Se registra tambien el descarte: es la mitad del algoritmo de
+            # flooding que evita la propagacion infinita en topologias con ciclos.
+            self.log(
+                f"[{self.router_id}] LSA de {origin} seq={message.get('sequence')} "
+                f"DESCARTADA por duplicada (llego via {came_from}); no se reenvia"
+            )
             return
 
         self.log(
             f"[{self.router_id}] LSA de {origin} seq={message.get('sequence')} "
-            f"aceptada. Recalculando Dijkstra."
+            f"ACEPTADA (via {came_from}). Recalculando Dijkstra."
         )
         self._flood(message, exclude=came_from)
 
@@ -448,14 +454,32 @@ class RouterNode:
         forward["from_router_id"] = self.router_id
         body = json.dumps(forward)
 
+        destinos = []
         for neighbor in self.neighbors:
             if neighbor["router_id"] == exclude:
                 continue
+            destinos.append(neighbor["router_id"])
             threading.Thread(
                 target=net.send_framed,
                 args=(neighbor["ip"], neighbor["port"], body),
                 daemon=True,
             ).start()
+
+        # El flooding es un paso evaluable del protocolo, asi que se registra de
+        # forma explicita, incluyendo a quien se excluye por split horizon.
+        origen = lsa["origin_router_id"]
+        etiqueta = "propia" if origen == self.router_id else f"de {origen}"
+        if destinos:
+            omitido = f", omitiendo a {exclude} (de donde vino)" if exclude else ""
+            self.log(
+                f"[{self.router_id}] FLOODING de LSA {etiqueta} "
+                f"seq={lsa['sequence']} hacia: {', '.join(destinos)}{omitido}"
+            )
+        elif exclude:
+            self.log(
+                f"[{self.router_id}] FLOODING de LSA {etiqueta} "
+                f"seq={lsa['sequence']} detenido: {exclude} es el unico vecino"
+            )
 
     # ------------------------------------------------------------ plano de datos
 
